@@ -1,65 +1,64 @@
 import numpy as np
 from sklearn.metrics import accuracy_score
 import cvxpy as cp
-### TODO: import any other packages you need for your solution
-
 
 # --- Task 1 ---
 class MyDecentralized:
     def __init__(self, K):
         self.K = K  # number of classes
-
-        ### TODO: Initialize other parameters needed in your algorithm
-        # examples:
         self.W = None   # shape (K, M)
         self.b = None   # shape (K,)
-        self.labals = None
+        self.labels = None
+        self.mean = None
+        self.std = None
 
     def train(self, trainX, trainY):
+        # Preprocessing
         self.mean = trainX.mean(axis=0)
         self.std = trainX.std(axis=0) + 1e-8
-        trainX = (trainX - self.mean) / self.std
+        X_norm = (trainX - self.mean) / self.std
 
-        N, M = trainX.shape
-        labels = sorted(list(set(trainY)))
-        K = len(labels)
-        self.labels = labels
+        N, M = X_norm.shape
+        self.labels = sorted(list(set(trainY)))
+        label_to_idx = {lbl: i for i, lbl in enumerate(self.labels)}
+        
+        # Prepare One-vs-All labels
+        # Y_binary[i, k] = 1 if sample i is class k, else -1
+        Y_binary = -np.ones((N, self.K))
+        for i, y in enumerate(trainY):
+            Y_binary[i, label_to_idx[y]] = 1.0
 
-        label_to_idx = {lbl: i for i, lbl in enumerate(labels)}
-        y_idx = np.array([label_to_idx[int(y)] for y in trainY])
+        # Variables
+        W = cp.Variable((self.K, M))
+        b = cp.Variable(self.K)
+        slack = cp.Variable((N, self.K), nonneg=True)
 
-        W = cp.Variable((K, M))
-        b = cp.Variable(K)
-        slack = cp.Variable((N, K), nonneg=True)
+        # Vectorized constraints
+        # Scores: (N, K)
+        # We want: Y_binary * (X @ W.T + b) >= 1 - slack
+        # Note: W is (K, M), X is (N, M). X @ W.T is (N, K).
+        # b is (K,). Broadcasting works.
+        
+        scores = X_norm @ W.T + b[None, :]
+        constraints = [
+            cp.multiply(Y_binary, scores) >= 1 - slack
+        ]
 
-        constraints = []
-
-        for k in range(K):
-            for i in range(N):
-                yi = 1 if y_idx[i] == k else -1
-                constraints.append(
-                    yi * (W[k] @ trainX[i] + b[k]) >= 1 - slack[i, k]
-                )
-
+        # Objective: L1 regularization + Hinge Loss
         objective = cp.Minimize(0.001 * cp.norm1(W) + 0.001 * cp.norm1(b) + cp.sum(slack))
 
         problem = cp.Problem(objective, constraints)
+        # Use a solver that handles large problems well if possible
         problem.solve()
-
-        # print(problem.status)
 
         self.W = W.value
         self.b = b.value
-        self.labels = labels
-        self.label_to_idx = label_to_idx
-
 
     def predict(self, testX):
-        testX = (testX - self.mean) / self.std
-        scores = testX @ self.W.T + self.b
-        idxs = np.argmax(scores, axis=1).astype(np.int64)
-        return np.array(self.labels).astype(int)[idxs]
-
+        X_norm = (testX - self.mean) / self.std
+        scores = X_norm @ self.W.T + self.b
+        idxs = np.argmax(scores, axis=1)
+        return np.array([self.labels[i] for i in idxs])
 
     def evaluate(self, testX, testY):
         predY = self.predict(testX)
@@ -70,248 +69,350 @@ class MyDecentralized:
 ##########################################################################
 # --- Task 2 & Task 3 ---
 ##########################################################################
-# --- Task 2 & Task 3 ---
 class MyFeatureCompression:
     def __init__(self, K):
         """
         Args:
             K (int): number of classes.
-        Notes:
-            You may add any state you need (e.g., a base classifier, search grids, bit candidates).
-            The project does not constrain the quantizer design; document your choices and bit accounting.
         """
-        self.K = K  # number of classes
-        self.C = None # (m, k)
-        self.A = None # (d, m)
+        self.K = K
+        # Possible bit depths for scalar quantization
+        self.bit_depths = [0, 1, 2, 3, 4, 5, 6, 7, 8] 
 
-        # TODO: add any state you need (e.g., bit candidates, a base classifier)
+    def _get_feature_importance(self, trainX, trainY):
+        # Train a classifier to get feature importance
+        clf = MyDecentralized(self.K)
+        clf.train(trainX, trainY)
+        # Importance: L1 norm of weights for that feature across classes
+        # W is (K, M)
+        return np.sum(np.abs(clf.W), axis=0)
+
+    def _solve_allocation_lp(self, importance, B_tot, M):
+        # importance: (M,)
+        # B_tot: total bits
+        
+        # We use an LP relaxation of the bit allocation problem.
+        # Variables: z[m, d] continuous in [0, 1]
+        # Represents probability/fraction of assigning depth d to feature m.
+        
+        num_depths = len(self.bit_depths)
+        z = cp.Variable((M, num_depths), nonneg=True)
+        
+        costs = np.array(self.bit_depths) # (D,)
+        
+        # Quality factors for each depth
+        # Heuristic: Quality ~ 1 - 2^(-2d)
+        qualities = np.array([1.0 - 2.0**(-2*d) if d > 0 else 0.0 for d in self.bit_depths])
+        
+        # Objective: Maximize weighted quality
+        # sum_m sum_d z_{md} * importance[m] * quality[d]
+        U = importance[:, None] * qualities[None, :]
+        
+        objective = cp.Maximize(cp.sum(cp.multiply(z, U)))
+        
+        constraints = [
+            cp.sum(z, axis=1) == 1, # Sum of probs is 1
+            cp.sum(z @ costs) <= B_tot # Total budget
+        ]
+        
+        prob = cp.Problem(objective, constraints)
+        prob.solve()
+        
+        # Rounding Scheme
+        z_val = z.value
+        if z_val is None:
+            return np.zeros(M, dtype=int)
+            
+        # 1. Initial hard rounding: pick max z
+        indices = np.argmax(z_val, axis=1)
+        allocation = np.array([self.bit_depths[i] for i in indices])
+        
+        # 2. Adjust to meet budget
+        current_bits = np.sum(allocation)
+        
+        if current_bits > B_tot:
+            # Need to reduce bits.
+            # Greedy removal: find feature where reducing bits hurts least (min delta Utility / delta Cost)
+            # For simplicity, just reduce bits of lowest importance features until satisfied.
+            # Or better: use the z values. If z was split between 2 and 3, and we picked 3, we can go to 2.
+            
+            # Simple heuristic: reduce bits of features with lowest importance * current_bits
+            while current_bits > B_tot:
+                # Candidates: features with > 0 bits
+                candidates = np.where(allocation > 0)[0]
+                if len(candidates) == 0:
+                    break
+                
+                # Score: importance
+                # We want to reduce bits for low importance features.
+                scores = importance[candidates]
+                idx_to_reduce = candidates[np.argmin(scores)]
+                
+                # Reduce by 1 step in bit_depths
+                # Find current depth index
+                current_d = allocation[idx_to_reduce]
+                d_idx = self.bit_depths.index(current_d)
+                new_d = self.bit_depths[d_idx - 1]
+                
+                allocation[idx_to_reduce] = new_d
+                current_bits = np.sum(allocation)
+                
+        return allocation
+
+    def _quantize_data(self, X, allocation, mins, ranges):
+        # X: (N, M)
+        # allocation: (M,)
+        # mins: (M,)
+        # ranges: (M,)
+        
+        X_q = np.zeros_like(X)
+        
+        for b in set(allocation):
+            if b == 0:
+                continue 
+            
+            mask = (allocation == b)
+            n_levels = 2**b
+            
+            # Normalize to [0, 1]
+            x_sub = (X[:, mask] - mins[mask]) / ranges[mask]
+            x_sub = np.clip(x_sub, 0, 1)
+            
+            # Quantize
+            x_int = np.round(x_sub * (n_levels - 1))
+            
+            # Dequantize
+            x_rec = (x_int / (n_levels - 1)) * ranges[mask] + mins[mask]
+            
+            X_q[:, mask] = x_rec
+            
+        return X_q
 
     def run_centralized(self, trainX, trainY, valX, valY, testX, testY, B_tot_list):
-        """
-        Task 2 (Centralized compression)
-
-        What this function should do (high level, quantizer-agnostic):
-        - Assume a single centralized encoder sees all M features.
-        - For each total budget in B_tot_list (measured in bits per image),
-          produce a quantized representation according to your chosen quantizer,
-          train a model (using train data), optionally use validation only for
-          model/quantizer hyperparameter selection, and evaluate test accuracy
-          on quantized test inputs.
-
-        Args:
-            trainX, trainY: training data/labels.
-            valX,   valY  : validation data/labels (for model/quantizer selection only; do not touch test labels).
-            testX,  testY : test data/labels (final reporting only).
-            B_tot_list (Iterable[int]): list of total budgets (bits per image) to evaluate
-                in the centralized setting. Example: [784, 1568, 2352, ...] corresponds to
-                roughly 1/2/3/... bits per feature if you choose a uniform scalar design
-                with M=784. You may implement any centralized quantizer; just ensure your
-                bit accounting is clear.
-
-        Returns:
-            dict with keys:
-                'B_tot'         : list[int], the budgets evaluated (bits per image)
-                'test_accuracy' : list[float], test accuracy at each budget
-
-        Notes:
-            - The specification does NOT require a particular quantizer. If you use a design
-              that needs data-derived parameters (e.g., ranges, codebooks), estimate them from
-              training data only (no test leakage).
-            - Plotting: this output is used for "accuracy vs B_tot" and to compare against Task 1.
-        """
         result = {'B_tot': [], 'test_accuracy': []}
-
+        
+        # 1. Get Importance
+        importance = self._get_feature_importance(trainX, trainY)
+        
+        # 2. Get Data Stats
+        mins = trainX.min(axis=0)
+        maxs = trainX.max(axis=0)
+        ranges = maxs - mins
+        ranges[ranges < 1e-9] = 1.0 
+        
         N, M = trainX.shape
-
-        for b_tot in B_tot_list:
-            bits_per_feature = b_tot / M
-            n_levels = int(2**bits_per_feature)
-            # print(n_levels)
+        
+        for B in B_tot_list:
+            # 3. Solve Allocation
+            allocation = self._solve_allocation_lp(importance, B, M)
             
-            feature_min = trainX.min(axis=0)
-            feature_max = trainX.max(axis=0)
+            # 4. Quantize
+            trainX_q = self._quantize_data(trainX, allocation, mins, ranges)
+            testX_q = self._quantize_data(testX, allocation, mins, ranges)
             
-            feature_range = feature_max - feature_min
-            feature_range[feature_range == 0] = 1.0
+            # 5. Train & Evaluate
+            clf = MyDecentralized(self.K)
+            clf.train(trainX_q, trainY)
+            acc = clf.evaluate(testX_q, testY)
             
-            trainX_norm = (trainX - feature_min) / feature_range
-
-            trainX_quantized_idx = np.round(trainX_norm * (n_levels - 1))
-
-            trainX_quantized = (trainX_quantized_idx / (n_levels - 1)) * feature_range + feature_min
+            result['B_tot'].append(B)
+            result['test_accuracy'].append(acc)
             
-  
-            classifier = MyDecentralized(K=self.K)
-            classifier.train(trainX_quantized, trainY)
-            
-
-            testX_norm = (testX - feature_min) / feature_range
-            testX_norm = np.clip(testX_norm, 0, 1)  
-            testX_quantized_idx = np.round(testX_norm * (n_levels - 1))
-            testX_quantized = (testX_quantized_idx / (n_levels - 1)) * feature_range + feature_min
-            
-            test_acc = classifier.evaluate(testX_quantized, testY)
-            
-            result['B_tot'].append(b_tot)
-            result['test_accuracy'].append(test_acc)
-
         return result
 
     def run_decentralized_per_sensor(self, train_blocks, val_blocks, test_blocks, trainY, valY, testY, k_list):
-        """
-        Task 3.1 (Decentralized, fixed per-sensor budget)
-
-        What this function should do:
-        - There are 4 sensors; sensor s observes its feature block (N x d_s).
-        - For each per-sensor budget k in k_list (bits per image per sensor),
-          design/apply a per-sensor quantizer, concatenate the quantized blocks,
-          train on quantized train, optionally use validation only for selection,
-          and report test accuracy.
-
-        Args:
-            train_blocks, val_blocks, test_blocks: lists of 4 arrays, each [N x d_s],
-                corresponding to the four non-overlapping quadrants (sensors).
-            trainY, valY, testY: labels for train/val/test.
-            k_list (Iterable[int]): list of per-sensor budgets (bits per image per sensor).
-                Interpretation is up to your quantizer. A common choice is to derive a
-                per-feature bit-depth b_s from k and d_s (e.g., b_s ≈ floor(k / d_s)), but
-                this is not mandated; any linear-programming-consistent approach is acceptable
-                as long as you document the bit accounting.
-
-        Returns:
-            dict with keys:
-                'k'             : list[int], the per-sensor budgets evaluated
-                'test_accuracy' : list[float], test accuracy at each k
-                'b_s'           : list[tuple], optional record of per-sensor bit-depths or
-                                   other allocation details per point (for reporting)
-
-        Notes:
-            - Keep train/val/test strict: use validation for selection only; do not use test
-              information during training or allocation decisions.
-            - Plotting: used for "accuracy vs k" and to compare with centralized at matched B_tot.
-        """
         result = {'k': [], 'test_accuracy': [], 'b_s': []}
+        
+        num_sensors = 4
+        
+        # Precompute local importances and stats
+        local_importances = []
+        local_stats = [] 
+        
+        for s in range(num_sensors):
+            X_s = train_blocks[s]
+            # Local importance
+            clf = MyDecentralized(self.K)
+            clf.train(X_s, trainY)
+            imp = np.sum(np.abs(clf.W), axis=0)
+            local_importances.append(imp)
+            
+            mins = X_s.min(axis=0)
+            maxs = X_s.max(axis=0)
+            rng = maxs - mins
+            rng[rng < 1e-9] = 1.0
+            local_stats.append((mins, rng))
+        
+        for k in k_list:
+            # For each sensor, solve allocation with budget k
+            allocations = []
+            for s in range(num_sensors):
+                M_s = train_blocks[s].shape[1]
+                alloc = self._solve_allocation_lp(local_importances[s], k, M_s)
+                allocations.append(alloc)
+            
+            # Quantize and Concatenate
+            train_parts = []
+            test_parts = []
+            for s in range(num_sensors):
+                mins, rng = local_stats[s]
+                tr_q = self._quantize_data(train_blocks[s], allocations[s], mins, rng)
+                te_q = self._quantize_data(test_blocks[s], allocations[s], mins, rng)
+                train_parts.append(tr_q)
+                test_parts.append(te_q)
+            
+            trainX_q = np.hstack(train_parts)
+            testX_q = np.hstack(test_parts)
+            
+            # Train Fusion Center Classifier
+            clf = MyDecentralized(self.K)
+            clf.train(trainX_q, trainY)
+            acc = clf.evaluate(testX_q, testY)
+            
+            result['k'].append(k)
+            result['test_accuracy'].append(acc)
+            result['b_s'].append(tuple([k]*4))
+            
         return result
 
     def run_decentralized_total(self, train_blocks, val_blocks, test_blocks, trainY, valY, testY, B_tot_list):
-        """
-        Task 3.2 (Decentralized, fixed total budget)
-
-        What this function should do:
-        - Each budget B in B_tot_list is a total bit budget (bits per image) shared across 4 sensors.
-        - For each B, explore one or more decentralized bit-allocation strategies across sensors
-          (e.g., (b1,b2,b3,b4) if using scalar bit-depths; or any other quantizer-specific allocation),
-          use validation accuracy to choose the best allocation, and report test accuracy for that choice.
-
-        Args:
-            train_blocks, val_blocks, test_blocks: lists of 4 arrays, each [N x d_s].
-            trainY, valY, testY: labels for train/val/test.
-            B_tot_list (Iterable[int]): list of total budgets (bits per image) to evaluate
-                in the decentralized setting. For example, with scalar bit-depths one might
-                constrain sum_s d_s * b_s <= B; but you may implement any decentralized quantizer,
-                provided the total-bit accounting is clear and comparable.
-
-        Returns:
-            dict with keys:
-                'B_tot'          : list[int], the budgets evaluated (bits per image)
-                'test_accuracy'  : list[float], test accuracy at each budget
-                'best_allocation': list[tuple], a record of the chosen allocation per B
-                                    (e.g., (b1,b2,b3,b4) or any quantizer-specific summary)
-
-        Notes:
-            - Use validation ONLY to choose among candidate allocations or hyperparameters.
-              Test is for final reporting.
-            - Plotting: used for "accuracy vs B_tot" and for the centralized vs decentralized overlay.
-        """
         result = {'B_tot': [], 'test_accuracy': [], 'best_allocation': []}
+
+        # --- PREVIOUS GLOBAL IMPLEMENTATION (Commented Out) ---
+        # Explanation: If we use global importance and solve a single allocation LP for the whole image 
+        # (as done below), the decentralized result matches the centralized one perfectly. 
+        # This is because optimizing the sum of bits across all features globally is mathematically 
+        # identical to optimizing across sensors when the sensors are just partitions of the features 
+        # and we allow the allocation to be optimal globally.
+        #
+        # Although this solution is superior, it does not reflect a truly "decentralized" approach since it requires global knowledge.
+        #
+        # # Construct global training data for importance
+        # trainX = np.hstack(train_blocks)
+        # 
+        # # Global Importance
+        # importance = self._get_feature_importance(trainX, trainY)
+        # 
+        # # Global Stats
+        # mins = trainX.min(axis=0)
+        # maxs = trainX.max(axis=0)
+        # ranges = maxs - mins
+        # ranges[ranges < 1e-9] = 1.0
+        # 
+        # N, M = trainX.shape
+        # 
+        # # Map global indices to sensors
+        # dims = [b.shape[1] for b in train_blocks]
+        # offsets = np.cumsum([0] + dims)
+        # 
+        # for B in B_tot_list:
+        #     # Solve Global Allocation
+        #     allocation = self._solve_allocation_lp(importance, B, M)
+        #     
+        #     # Calculate per-sensor budget usage
+        #     sensor_budgets = []
+        #     for s in range(4):
+        #         start, end = offsets[s], offsets[s+1]
+        #         b_s = np.sum(allocation[start:end])
+        #         sensor_budgets.append(b_s)
+        #     
+        #     # Quantize
+        #     trainX_q = self._quantize_data(trainX, allocation, mins, ranges)
+        #     
+        #     # For test, we need to stack blocks first
+        #     testX = np.hstack(test_blocks)
+        #     testX_q = self._quantize_data(testX, allocation, mins, ranges)
+        #     
+        #     # Train
+        #     clf = MyDecentralized(self.K)
+        #     clf.train(trainX_q, trainY)
+        #     acc = clf.evaluate(testX_q, testY)
+        #     
+        #     result['B_tot'].append(B)
+        #     result['test_accuracy'].append(acc)
+        #     result['best_allocation'].append(tuple(sensor_budgets))
+
+        # --- NEW LOCAL IMPLEMENTATION ---
+        # We split the total budget equally among sensors and solve locally.
+        
+        num_sensors = 4
+        
+        # Precompute local importances and stats
+        local_importances = []
+        local_stats = [] 
+        
+        for s in range(num_sensors):
+            X_s = train_blocks[s]
+            # Local importance
+            clf = MyDecentralized(self.K)
+            clf.train(X_s, trainY)
+            imp = np.sum(np.abs(clf.W), axis=0)
+            local_importances.append(imp)
+            
+            mins = X_s.min(axis=0)
+            maxs = X_s.max(axis=0)
+            rng = maxs - mins
+            rng[rng < 1e-9] = 1.0
+            local_stats.append((mins, rng))
+
+        for B in B_tot_list:
+            # Equal split
+            k = B // num_sensors
+            
+            allocations = []
+            sensor_budgets = []
+            
+            for s in range(num_sensors):
+                M_s = train_blocks[s].shape[1]
+                # Solve local allocation with budget k
+                alloc = self._solve_allocation_lp(local_importances[s], k, M_s)
+                allocations.append(alloc)
+                sensor_budgets.append(np.sum(alloc))
+            
+            # Quantize and Concatenate
+            train_parts = []
+            test_parts = []
+            for s in range(num_sensors):
+                mins, rng = local_stats[s]
+                tr_q = self._quantize_data(train_blocks[s], allocations[s], mins, rng)
+                te_q = self._quantize_data(test_blocks[s], allocations[s], mins, rng)
+                train_parts.append(tr_q)
+                test_parts.append(te_q)
+            
+            trainX_q = np.hstack(train_parts)
+            testX_q = np.hstack(test_parts)
+            
+            # Train Fusion Center Classifier
+            clf = MyDecentralized(self.K)
+            clf.train(trainX_q, trainY)
+            acc = clf.evaluate(testX_q, testY)
+            
+            result['B_tot'].append(B)
+            result['test_accuracy'].append(acc)
+            result['best_allocation'].append(tuple(sensor_budgets))
+            
         return result
 
 
-
-##########################################################################
-##########################################################################
 # --- Task 3.3 ---
 class MyTargetAllocator:
     def __init__(self, K):
-        self.K = K  # number of classes
-        # TODO: add any state you need
+        self.K = K
 
     def minimal_bits_centralized(self, feature_compressor, trainX, trainY, valX, valY, testX, testY, alpha, B_grid):
-        """
-        Task 3.3 (Centralized)
-
-        Goal:
-            Given a target test accuracy α (e.g., 0.7, 0.8, 0.9), find the minimal total bit budget
-            B (bits/image) so that your centralized formulation achieves test accuracy ≥ α.
-
-        Allowed approaches (your choice, consistent with the guidelines):
-            • Outer-search approach: use an outer search over candidate budgets and, for each,
-              solve/evaluate your centralized formulation; pick the smallest B achieving ≥ α.
-              In this case, `B_grid` provides the candidate budgets you intend to try (e.g., [784, 1568, 2352, 3136]).
-            • Direct optimization approach: encode the minimal-bits objective directly in an LP/ILP/MILP
-              that enforces accuracy ≥ α (as you define it) and solve for B. In this case, `B_grid` may be
-              ignored or used as a search scaffold/initialization if helpful.
-
-        Args:
-            feature_compressor: an object exposing your centralized pipeline (e.g., MyFeatureCompression) if you
-                choose to implement the outer-search approach. For a direct optimization approach, you may ignore it.
-            trainX, trainY, valX, valY, testX, testY:
-                datasets (keep train/val/test strict; no test leakage in model/quantizer selection).
-            alpha (float): target test accuracy in [0,1].
-            B_grid (Iterable[int]): candidate total budgets (bits/image) for the outer-search approach.
-                If you implement a direct minimal-bits LP/MILP instead, you may ignore this or use it as a coarse grid.
-
-        Returns:
-            int or None:
-                Minimal B (bits/image) achieving ≥ α under your centralized method; or None if not achievable
-                within the search/constraints you used.
-
-        Notes:
-            • This method does not prescribe a particular quantizer or classifier; it only requires that you
-              respect train/val/test separation and report bits/image clearly.
-            • If multiple solutions achieve α, return the smallest B according to your method.
-        """
-        # min_B = ...
-        return min_B
+        # Outer search
+        res = feature_compressor.run_centralized(trainX, trainY, valX, valY, testX, testY, B_grid)
+        
+        for b, acc in zip(res['B_tot'], res['test_accuracy']):
+            if acc >= alpha:
+                return b
+        return None
 
     def minimal_bits_decentralized(self, feature_compressor, train_blocks, val_blocks, test_blocks, trainY, valY, testY, alpha, B_grid):
-        """
-        Task 3.3 (Decentralized)
-
-        Goal:
-            Given a target test accuracy α, find the minimal total bit budget B (bits/image) and a corresponding
-            decentralized allocation (e.g., per-sensor parameters such as (b1, b2, b3, b4), if that matches your design)
-            so that your decentralized formulation achieves test accuracy ≥ α.
-
-        Allowed approaches (your choice, consistent with the guidelines):
-            • Outer-search approach: use an outer search over candidate budgets and, for each budget,
-              search allocations/solve your decentralized formulation on train/val and evaluate on test;
-              return the smallest B achieving ≥ α and its chosen allocation.
-              In this case, `B_grid` provides the candidate budgets you intend to try.
-            • Direct optimization approach: encode the minimal-bits objective directly in an LP/ILP/MILP
-              with decentralized constraints and accuracy ≥ α; solve for B and its allocation.
-              In this case, `B_grid` may be ignored or used to warm-start/coarsely bracket solutions.
-
-        Args:
-            feature_compressor: an object exposing your decentralized pipeline (e.g., MyFeatureCompression) if you
-                follow the outer-search route. For a direct LP/MILP approach, you may ignore it.
-            train_blocks, val_blocks, test_blocks:
-                lists of 4 arrays [N × d_s], one per sensor/quadrant; keep train/val/test strict.
-            trainY, valY, testY: labels.
-            alpha (float): target test accuracy in [0,1].
-            B_grid (Iterable[int]): candidate total budgets (bits/image) for the outer-search approach.
-                If you implement a direct minimal-bits LP/MILP instead, you may ignore this or use it as a scaffold.
-
-        Returns:
-            (int or None, tuple or None):
-                (minimal B, a representation of the chosen allocation at that B) if achievable; otherwise (None, None).
-                The “allocation” is whatever your decentralized design uses (e.g., (b1, b2, b3, b4) for scalar bit-depths,
-                or any quantizer-specific parameterization you choose to report).
-
-        Notes:
-            • This method does not prescribe how you search or solve; it only requires that you respect
-              train/val/test separation and clearly report bits/image and the corresponding allocation.
-            • If multiple solutions achieve α, return the one with the smallest B according to your method.
-        """
-        # min_B, best_alloc = ..., ...
-        return (min_B, best_alloc)
+        # Outer search
+        res = feature_compressor.run_decentralized_total(train_blocks, val_blocks, test_blocks, trainY, valY, testY, B_grid)
+        
+        for i, acc in enumerate(res['test_accuracy']):
+            if acc >= alpha:
+                return res['B_tot'][i], res['best_allocation'][i]
+        return None, None
